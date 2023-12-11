@@ -61,6 +61,8 @@ import re  # TODO use regex when it will be standard
 import sys
 from io import StringIO
 from multiprocessing import Queue, get_context, cpu_count
+# Use queue so that API is still compatible
+import queue
 from timeit import default_timer
 
 from extract import Extractor, ignoreTag, define_template, acceptedNamespaces
@@ -269,6 +271,7 @@ def decode_open(filename, mode='rt', encoding='utf-8'):
     :param filename: the file to open.
     """
     ext = os.path.splitext(filename)[1]
+    ext = ext.strip()
     if ext == '.gz':
         import gzip
         return gzip.open(filename, mode, encoding=encoding)
@@ -414,61 +417,54 @@ def process_dump(input_file, template_file, out_file, file_size, file_compress,
     # - a reduce process collects the results, sort them and print them.
 
     # fixes MacOS error: TypeError: cannot pickle '_io.TextIOWrapper' object
-    Process = get_context("spawn").Process
+    # Remove multliprocessing to avoid bugs on Windows
+    # Process = get_context("spawn").Process
 
     maxsize = 10 * process_count
     # output queue
-    output_queue = Queue(maxsize=maxsize)
+    output_queue = queue.Queue()
 
     # Reduce job that sorts and prints output
-    reduce = Process(target=reduce_process, args=(output_queue, output))
-    reduce.start()
+    # Remove multiprocessing to avoid bugs on windows
+    # reduce = Process(target=reduce_process, args=(output_queue, output))
+    # reduce.start()
 
     # initialize jobs queue
-    jobs_queue = Queue(maxsize=maxsize)
+    jobs_queue = queue.Queue()
 
     # start worker processes
     logging.info("Using %d extract processes.", process_count)
-    workers = []
-    for _ in range(max(1, process_count)):
-        extractor = Process(target=extract_process,
-                            args=(jobs_queue, output_queue, html_safe))
-        extractor.daemon = True  # only live while parent process lives
-        extractor.start()
-        workers.append(extractor)
-
-    # Mapper process
-
-    # we collect individual lines, since str.join() is significantly faster
-    # than concatenation
-
-    ordinal = 0  # page count
+    
+    ordinal = 1  # page count
     for id, revid, title, page in collect_pages(input):
-        job = (id, revid, urlbase, title, page, ordinal)
-        jobs_queue.put(job)  # goes to any available extract_process
-        ordinal += 1
+        if ordinal % 65536 != 0:
+            job = (id, revid, urlbase, title, page, ordinal)
+            jobs_queue.put(job)  # goes to any available extract_process
+            ordinal += 1
+        else:
+            extract_process(jobs_queue, output_queue, html_safe)
+            reduce_process(output_queue, output)
+            jobs_queue = queue.Queue()
+            ordinal = 1
 
-    input.close()
 
-    # signal termination
-    for _ in workers:
-        jobs_queue.put(None)
-    # wait for workers to terminate
-    for w in workers:
-        w.join()
+    if not jobs_queue.empty():
+        logging.info("Leftover of  collect_pages")
+        extract_process(jobs_queue, output_queue, html_safe)
+        reduce_process(output_queue, output)
+    else:
+        logging.info("jobs_queue is empty after loop")
+   
+    reduce_process(output_queue, output)
+    output.close()
 
-    # signal end of work to reduce process
-    output_queue.put(None)
-    # wait for it to finish
-    reduce.join()
-
-    if output != sys.stdout:
-        output.close()
     extract_duration = default_timer() - extract_start
     extract_rate = ordinal / extract_duration
     logging.info("Finished %d-process extraction of %d articles in %.1fs (%.1f art/s)",
                  process_count, ordinal, extract_duration, extract_rate)
 
+                 
+    
 
 # ----------------------------------------------------------------------
 # Multiprocess support
@@ -480,7 +476,12 @@ def extract_process(jobs_queue, output_queue, html_safe):
     :param output_queue: where to queue extracted text for output.
     :html_safe: whether to convert entities in text to HTML.
     """
+    cnt = 0
     while True:
+        # Break if queue.Queue is empty
+        if jobs_queue.empty():
+            logging.info("jobs_queue is empty inside extrat_process after %d", cnt)
+            break
         job = jobs_queue.get()  # job is (id, revid, urlbase, title, page)
         if job:
             out = StringIO()  # memory buffer
@@ -490,7 +491,7 @@ def extract_process(jobs_queue, output_queue, html_safe):
             out.close()
         else:
             break
-
+        cnt += 1
 
 def reduce_process(output_queue, output):
     """
@@ -503,7 +504,7 @@ def reduce_process(output_queue, output):
     period = 100000
     # FIXME: use a heap
     ordering_buffer = {}  # collected pages
-    next_ordinal = 0  # sequence number of pages
+    next_ordinal = 1  # sequence number of pages
     while True:
         if next_ordinal in ordering_buffer:
             output.write(ordering_buffer.pop(next_ordinal))
@@ -516,7 +517,11 @@ def reduce_process(output_queue, output):
                 interval_start = default_timer()
         else:
             # mapper puts None to signal finish
-            pair = output_queue.get()
+            # None if queue.Queue is empty
+            if output_queue.empty():
+                pair = None
+            else:
+                pair = output_queue.get()
             if not pair:
                 break
             ordinal, text = pair
